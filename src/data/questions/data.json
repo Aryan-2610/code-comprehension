@@ -1,0 +1,409 @@
+[
+  {
+    "id": "data-sql-injection-001",
+    "pack": "data",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV1",
+    "category": "sql-injection",
+    "context": "Login lookup · public endpoint · input is trimmed and lowercased 'so it is clean'",
+    "title": "User lookup by email",
+    "code": "def find_user(conn, email: str):\n    email = email.strip().lower()\n    if not email:\n        return None\n    cur = conn.cursor()\n    cur.execute(f\"SELECT id, name FROM users WHERE email = '{email}'\")\n    row = cur.fetchone()\n    cur.close()\n    return row",
+    "bugLine": 6,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "The email is formatted straight into the SQL text, so input like ' OR '1'='1 changes the query; bind parameters instead.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Lowercasing and stripping the email corrupts valid addresses, so some users can never be found by their login.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "fetchone on a non-unique email silently returns an arbitrary row, which can log the wrong user in.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Closing the cursor after fetchone discards the row, so the function returns None for users that do exist.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Trimming and lowercasing doesn't neutralise quotes. `x' OR '1'='1` or a stacked `'; DROP TABLE users; --` is still valid SQL. One public form field is enough to dump or destroy the users table.",
+    "blastRadius": [
+      "security",
+      "data-loss",
+      "privacy"
+    ],
+    "fixedCode": "def find_user(conn, email: str):\n    email = email.strip().lower()\n    if not email:\n        return None\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, name FROM users WHERE email = %s\", (email,))\n    row = cur.fetchone()\n    cur.close()\n    return row",
+    "interviewNote": "Sanitising is not parameterising. Placeholders keep data out of the SQL grammar entirely."
+  },
+  {
+    "id": "data-null-handling-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 3,
+    "severity": "SEV3",
+    "category": "null-handling",
+    "context": "Postgres · 30M customers · nightly cron · orders.customer_id is nullable (guest checkouts store NULL)",
+    "title": "Cleanup of never-ordered customers",
+    "code": "-- nightly cleanup: delete customers who have never placed an order\n-- orders.customer_id is nullable (guest checkouts store NULL)\nBEGIN;\n\nDELETE FROM customers\nWHERE id NOT IN (\n    SELECT customer_id\n    FROM orders\n);\n\nCOMMIT;",
+    "bugLine": 6,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "If the subquery returns any NULL, NOT IN evaluates to unknown for every row, so nothing is deleted and cleanup silently never runs.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "NOT IN on a large subquery forces a full table scan of customers, so the delete runs for hours and blocks all writers.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Deleting customers without cascading to related tables leaves orphaned rows that violate foreign keys and abort it.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Running the delete inside one transaction holds row locks until commit, so concurrent signups are blocked meanwhile.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "SQL's three-valued logic: `x NOT IN (1, 2, NULL)` is never true. One guest-checkout row with a NULL customer_id makes the predicate unknown for every customer, so the job reports success while deleting zero rows, and storage and PII retention quietly stop being enforced.",
+    "blastRadius": [
+      "cost",
+      "privacy"
+    ],
+    "fixedCode": "-- nightly cleanup: delete customers who have never placed an order\n-- orders.customer_id is nullable (guest checkouts store NULL)\nBEGIN;\n\nDELETE FROM customers c\nWHERE NOT EXISTS (\n    SELECT 1 FROM orders o WHERE o.customer_id = c.id\n);\n\nCOMMIT;",
+    "interviewNote": "NOT IN + NULL is the classic SQL interview trap. Prefer NOT EXISTS."
+  },
+  {
+    "id": "data-logic-error-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 2,
+    "severity": "SEV1",
+    "category": "logic-error",
+    "context": "Postgres · accounts table with free and paid plans · one-off maintenance script",
+    "title": "Close dormant EU free accounts",
+    "code": "-- close dormant free-tier accounts in the EU\nBEGIN;\n\nUPDATE accounts\nSET status = 'closed', closed_at = now()\nWHERE region = 'EU'\n  AND plan = 'free'\n  AND last_login < now() - interval '2 years'\n   OR status = 'suspended';\n\nCOMMIT;",
+    "bugLine": 9,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "AND binds tighter than OR, so every suspended account in any region or plan is closed, not just dormant EU free accounts.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Comparing last_login with now() minus an interval is evaluated per row, so the planner cannot use an index on last_login.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Setting closed_at with now() records the transaction start time, so all rows get the same timestamp when closed.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "An UPDATE touching many rows in one statement takes a table lock that blocks logins until the statement finishes.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "The WHERE reads as 'EU and free and dormant, or suspended', so the OR branch matches every suspended account worldwide, including paying customers. The migration commits, and support learns about it from angry emails.",
+    "blastRadius": [
+      "data-loss",
+      "money"
+    ],
+    "fixedCode": "-- close dormant free-tier accounts in the EU\nBEGIN;\n\nUPDATE accounts\nSET status = 'closed', closed_at = now()\nWHERE region = 'EU'\n  AND plan = 'free'\n  AND (last_login < now() - interval '2 years' OR status = 'suspended');\n\nCOMMIT;",
+    "interviewNote": "Mixing AND/OR without parentheses: AND wins. Also: run destructive updates as a SELECT first."
+  },
+  {
+    "id": "data-null-handling-002",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 2,
+    "severity": "SEV3",
+    "category": "null-handling",
+    "context": "Finance report · must list EVERY customer, including ones who never bought anything",
+    "title": "Revenue per customer",
+    "code": "-- report: every customer with their total paid revenue (0 if none)\nSELECT c.id,\n       c.name,\n       COALESCE(SUM(o.total_cents), 0) AS paid_cents\nFROM customers c\nLEFT JOIN orders o ON o.customer_id = c.id\nWHERE o.status = 'paid'\nGROUP BY c.id, c.name\nORDER BY paid_cents DESC;",
+    "bugLine": 7,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "The WHERE filter on o.status discards the NULL rows from the LEFT JOIN, so customers with no paid orders vanish from the report.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "COALESCE around SUM hides NULLs, so customers with data errors are reported as having zero revenue instead of failing.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Grouping by both id and name is redundant and slows the query, since name is already determined by the id.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Ordering by the alias paid_cents is not allowed in standard SQL, so the query fails on some database engines.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "A WHERE condition on the right table of a LEFT JOIN rejects the NULL-extended rows, quietly turning the LEFT JOIN into an INNER JOIN. The report looks fine but the zero-revenue customers, the whole reason for the outer join, are missing.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "-- report: every customer with their total paid revenue (0 if none)\nSELECT c.id,\n       c.name,\n       COALESCE(SUM(o.total_cents), 0) AS paid_cents\nFROM customers c\nLEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'paid'\nGROUP BY c.id, c.name\nORDER BY paid_cents DESC;",
+    "interviewNote": "Put right-table filters in the ON clause of a LEFT JOIN, not WHERE."
+  },
+  {
+    "id": "data-pagination-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 2,
+    "severity": "SEV3",
+    "category": "pagination-off-by-one",
+    "context": "Feed of 40k posts · importer inserts hundreds of rows sharing the same created_at · page size 50",
+    "title": "Feed pagination ordering",
+    "code": "-- GET /feed?page=N  (page size 50)\n-- bulk importer writes hundreds of posts with an identical created_at\n-- index: (published, created_at)\nSELECT id, title, created_at\nFROM posts\nWHERE published = true\nORDER BY created_at DESC\nLIMIT 50 OFFSET :offset;",
+    "bugLine": 7,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "created_at is not unique, so ties come back in arbitrary order and rows repeat or disappear between pages without a tiebreaker.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Sorting descending on an indexed column forces a filesort, so each page request re-sorts the whole posts table.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "A boolean filter on published has too few distinct values for any index to help, so the query always scans the table.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Binding :offset as a parameter prevents the planner from choosing an index, since the value is unknown at plan time.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Rows with equal created_at have no defined order, and the database may order them differently on each query. Page 2 can then repeat posts from page 1 and skip others, so users see duplicates and some posts are never visible.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "-- GET /feed?page=N  (page size 50)\n-- bulk importer writes hundreds of posts with an identical created_at\n-- index: (published, created_at)\nSELECT id, title, created_at\nFROM posts\nWHERE published = true\nORDER BY created_at DESC, id DESC\nLIMIT 50 OFFSET :offset;",
+    "interviewNote": "Pagination needs a total, deterministic ordering: add a unique tiebreaker (or use keyset pagination)."
+  },
+  {
+    "id": "data-float-money-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 1,
+    "severity": "SEV2",
+    "category": "float-money",
+    "context": "Billing schema · Postgres · invoices summed monthly for finance",
+    "title": "Invoice table design",
+    "code": "CREATE TABLE invoices (\n    id           BIGSERIAL PRIMARY KEY,\n    customer_id  BIGINT NOT NULL REFERENCES customers(id),\n    currency     CHAR(3) NOT NULL,\n    amount       DOUBLE PRECISION NOT NULL,\n    tax_rate     NUMERIC(5,4) NOT NULL,\n    issued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),\n    paid_at      TIMESTAMPTZ\n);",
+    "bugLine": 5,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Binary floating point cannot represent most decimal cents, so sums drift and invoices stop reconciling to the cent.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "DOUBLE PRECISION uses eight bytes per value, so the invoices table grows far larger than it would with a numeric type.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Floats cannot store values above one million, so large enterprise invoices overflow or silently round to zero.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Without a CHECK constraint on amount, negative invoices can be inserted, which breaks revenue reports.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "0.1 + 0.2 ≠ 0.3 in floating point. Millions of rows later, SUM(amount) is off by cents that no one can trace, and refunds don't exactly cancel charges. Store money as integer minor units or NUMERIC.",
+    "blastRadius": [
+      "money"
+    ],
+    "fixedCode": "CREATE TABLE invoices (\n    id           BIGSERIAL PRIMARY KEY,\n    customer_id  BIGINT NOT NULL REFERENCES customers(id),\n    currency     CHAR(3) NOT NULL,\n    amount_cents BIGINT NOT NULL,\n    tax_rate     NUMERIC(5,4) NOT NULL,\n    issued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),\n    paid_at      TIMESTAMPTZ\n);",
+    "interviewNote": "Money = integer cents or NUMERIC. Never FLOAT/DOUBLE."
+  },
+  {
+    "id": "data-race-condition-001",
+    "pack": "data",
+    "language": "python",
+    "difficulty": 3,
+    "severity": "SEV1",
+    "category": "race-condition",
+    "context": "Wallet service · psycopg3 · Postgres READ COMMITTED · double-tap on 'withdraw' is common",
+    "title": "Withdraw from balance",
+    "code": "def withdraw(conn, account_id: int, cents: int) -> None:\n    with conn.transaction():\n        row = conn.execute(\n            \"SELECT balance_cents FROM accounts WHERE id = %s\", (account_id,)\n        ).fetchone()\n        if row[\"balance_cents\"] < cents:\n            raise InsufficientFunds()\n        conn.execute(\n            \"UPDATE accounts SET balance_cents = %s WHERE id = %s\",\n            (row[\"balance_cents\"] - cents, account_id),\n        )",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Two concurrent withdrawals read the same balance, both pass the check, and the second write overwrites the first, losing a debit.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Running inside a transaction at READ COMMITTED means the balance is read from a stale snapshot taken at connect time.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "fetchone returns None when the account does not exist, so the subscript raises TypeError rather than a clear error.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Raising inside the with block rolls back the transaction, so the failed attempt is never recorded in an audit table.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "A transaction does not make read-modify-write atomic. Both requests read 100, both withdraw 80 and both write 20. The customer withdrew 160 from a 100 balance, the ledger says 20, and money was created from nothing.",
+    "blastRadius": [
+      "money",
+      "data-integrity"
+    ],
+    "fixedCode": "def withdraw(conn, account_id: int, cents: int) -> None:\n    with conn.transaction():\n        row = conn.execute(\n            \"SELECT balance_cents FROM accounts WHERE id = %s FOR UPDATE\", (account_id,)\n        ).fetchone()\n        if row[\"balance_cents\"] < cents:\n            raise InsufficientFunds()\n        conn.execute(\n            \"UPDATE accounts SET balance_cents = balance_cents - %s WHERE id = %s\",\n            (cents, account_id),\n        )",
+    "interviewNote": "Transactions ≠ locks. Use SELECT ... FOR UPDATE, or a single conditional UPDATE ... WHERE balance >= x."
+  },
+  {
+    "id": "data-blocking-lock-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 3,
+    "severity": "SEV1",
+    "category": "blocking-lock",
+    "context": "Postgres 15 · orders: 400M rows, ~3k writes/s · migration runs during business hours",
+    "title": "Add an index in a migration",
+    "code": "-- migration 0142: speed up the orders-by-customer lookup\n-- orders: 400M rows, ~3k writes/s, Postgres 15\nBEGIN;\n\nSET LOCAL lock_timeout = '5s';\nCREATE INDEX idx_orders_customer_id\n    ON orders (customer_id);\n\nCOMMIT;",
+    "bugLine": 6,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "A plain CREATE INDEX takes a lock that blocks all writes to orders for the whole build, which can take many minutes.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Indexing customer_id slows every insert, so the write rate of 3k per second can no longer be sustained afterwards.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "The lock_timeout of five seconds aborts the build once it passes five seconds, leaving a half-built invalid index.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Running DDL inside a transaction means a failed COMMIT leaves the index in place but invisible to the query planner.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "CREATE INDEX holds a SHARE lock on the table until the build finishes: reads continue but every INSERT/UPDATE/DELETE queues behind it. On 400M rows that's many minutes of an effective write outage, with connections piling up until the pool is exhausted.",
+    "blastRadius": [
+      "outage"
+    ],
+    "fixedCode": "-- migration 0142: speed up the orders-by-customer lookup\n-- orders: 400M rows, ~3k writes/s, Postgres 15\n-- NOTE: CONCURRENTLY cannot run inside a transaction block\nSET lock_timeout = '5s';\nCREATE INDEX CONCURRENTLY idx_orders_customer_id\n    ON orders (customer_id);",
+    "interviewNote": "Online schema changes: CREATE INDEX CONCURRENTLY, add columns without volatile defaults, avoid long ACCESS EXCLUSIVE locks."
+  },
+  {
+    "id": "data-index-bypass-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "index-bypass",
+    "context": "Postgres · payments: 2B rows · btree index on created_at (timestamp, stored in UTC) · dashboard refreshes every minute",
+    "title": "Today's revenue query",
+    "code": "-- daily revenue dashboard, refreshed every minute\n-- payments: 2B rows, btree index on created_at (timestamp, UTC)\n-- status has only a handful of distinct values\n-- one query per tile, ~40 tiles\nSELECT SUM(amount_cents) AS revenue_cents\nFROM payments\nWHERE status = 'succeeded'\n  AND DATE(created_at) = CURRENT_DATE;",
+    "bugLine": 8,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Wrapping created_at in DATE() makes the index unusable, so every refresh scans all 2 billion rows.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "CURRENT_DATE is evaluated once per row, so the dashboard can return inconsistent results if the query crosses midnight.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "SUM over a bigint column can overflow at this table size, silently wrapping the revenue figure to a negative number.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Filtering on status without a composite index with created_at forces a bitmap scan slower than a sequential scan.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "A function applied to an indexed column hides it from the planner (the predicate is no longer 'sargable'). The query is instant on a staging table with a million rows and becomes a minutes-long full scan every minute on 2B rows, saturating I/O for everyone else.",
+    "blastRadius": [
+      "outage",
+      "cost"
+    ],
+    "fixedCode": "-- daily revenue dashboard, refreshed every minute\n-- payments: 2B rows, btree index on created_at (timestamp, UTC)\n-- status has only a handful of distinct values\n-- one query per tile, ~40 tiles\nSELECT SUM(amount_cents) AS revenue_cents\nFROM payments\nWHERE status = 'succeeded'\n  AND created_at >= CURRENT_DATE\n  AND created_at <  CURRENT_DATE + 1;",
+    "interviewNote": "Keep the indexed column bare; move the work to the other side of the comparison (range, not function)."
+  },
+  {
+    "id": "data-integer-overflow-001",
+    "pack": "data",
+    "language": "sql",
+    "difficulty": 2,
+    "severity": "SEV1",
+    "category": "integer-overflow",
+    "context": "Postgres · device telemetry ingest ~8k inserts/s · table created 'small' in the first sprint",
+    "title": "Telemetry table",
+    "code": "-- ingest table for device telemetry (~8k inserts/s)\nCREATE TABLE telemetry (\n    id           INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    device_id    BIGINT NOT NULL,\n    metric       TEXT NOT NULL,\n    value        DOUBLE PRECISION NOT NULL,\n    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\nCREATE INDEX telemetry_device_time ON telemetry (device_id, recorded_at);",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "A 32-bit identity column tops out near 2.1 billion, which at 8k inserts per second is exhausted in about three days.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "GENERATED ALWAYS identity columns cannot be reset after bulk loads, so backfills from the old system will fail.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Using a surrogate key on a time series table wastes space, since device and timestamp already identify each row.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The index on device_id and recorded_at will not be used by queries that filter on recorded_at alone.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "INT maxes out at 2,147,483,647. When the sequence hits it, every insert fails with 'integer out of range' and ingestion stops. Fixing it means rewriting a multi-billion row table under pressure. Pick BIGINT up front.",
+    "blastRadius": [
+      "outage",
+      "data-loss"
+    ],
+    "fixedCode": "-- ingest table for device telemetry (~8k inserts/s)\nCREATE TABLE telemetry (\n    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    device_id    BIGINT NOT NULL,\n    metric       TEXT NOT NULL,\n    value        DOUBLE PRECISION NOT NULL,\n    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\nCREATE INDEX telemetry_device_time ON telemetry (device_id, recorded_at);",
+    "interviewNote": "Do the arithmetic: capacity ÷ write rate. 2^31 isn't as big as it sounds."
+  }
+]

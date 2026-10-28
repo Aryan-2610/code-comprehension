@@ -1,0 +1,407 @@
+[
+  {
+    "id": "trap-shared-state-001",
+    "pack": "traps",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV2",
+    "category": "shared-state",
+    "context": "Analytics client · gunicorn, 8 threads · record_event() called from every request handler",
+    "title": "The helpful default argument",
+    "code": "def record_event(name, payload, events=[]):\n    events.append({\"name\": name, \"payload\": payload, \"ts\": time.time()})\n    if len(events) >= 100:\n        flush(events)\n        events.clear()\n    return events\n\ndef track_login(user_id):\n    record_event(\"login\", {\"user\": user_id})",
+    "bugLine": 1,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "The default list is created once at definition time, so every call that omits events shares and mutates the same list.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Appending to the list while flush runs raises RuntimeError, because Python lists cannot be modified during iteration.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "events.clear() frees the list but not the dicts inside it, so event payloads stay in memory until the next collection.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The flush threshold is checked after the append, so the buffer briefly holds 101 events and can overflow downstream limits.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "The classic mutable-default trap. Default values are evaluated once, when the function is defined, so every caller who relies on the default shares one list. Events from different users get flushed together, are reordered, or are lost on clear().",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "def record_event(name, payload, events=None):\n    if events is None:\n        events = []\n    events.append({\"name\": name, \"payload\": payload, \"ts\": time.time()})\n    if len(events) >= 100:\n        flush(events)\n        events.clear()\n    return events\n\ndef track_login(user_id):\n    record_event(\"login\", {\"user\": user_id})",
+    "interviewNote": "Top-3 Python interview question. Defaults are evaluated at def time, not call time."
+  },
+  {
+    "id": "trap-null-handling-001",
+    "pack": "traps",
+    "language": "javascript",
+    "difficulty": 2,
+    "severity": "SEV1",
+    "category": "null-handling",
+    "context": "Payments SDK · callers pass retries: 0 for charge calls that must never be retried",
+    "title": "Option defaults",
+    "code": "function createPaymentClient(options = {}) {\n  const baseUrl = options.baseUrl ?? 'https://pay.internal';\n  const retries = options.retries || 3;\n  const timeoutMs = options.timeoutMs ?? 5000;\n\n  return {\n    async charge(body) {\n      return request(baseUrl + '/charges', { method: 'POST', body, retries, timeoutMs });\n    },\n  };\n}",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "retries: 0 is falsy, so || replaces it with 3 and a charge the caller meant never to retry can be sent up to four times.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Destructuring options with a default of {} fails when the caller passes null, throwing before the client is created.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Closing over baseUrl in the returned object keeps the options object alive, leaking memory for every client created.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Concatenating baseUrl with the path produces a double slash if the base URL ends with a slash, breaking requests.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "`||` treats 0, '', false and NaN as 'missing'. The one caller who explicitly asked for zero retries silently gets three, on a non-idempotent endpoint. Use `??`, which only falls back for null and undefined.",
+    "blastRadius": [
+      "money"
+    ],
+    "fixedCode": "function createPaymentClient(options = {}) {\n  const baseUrl = options.baseUrl ?? 'https://pay.internal';\n  const retries = options.retries ?? 3;\n  const timeoutMs = options.timeoutMs ?? 5000;\n\n  return {\n    async charge(body) {\n      return request(baseUrl + '/charges', { method: 'POST', body, retries, timeoutMs });\n    },\n  };\n}",
+    "interviewNote": "`||` vs `??` is a favourite JS interview probe. Same family: `if (count)` when 0 is valid."
+  },
+  {
+    "id": "trap-broken-equality-001",
+    "pack": "traps",
+    "language": "java",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "broken-equality",
+    "context": "Document service · all tests use user ids 1–50 · production ids run into the millions",
+    "title": "Permission check",
+    "code": "class AccessCheck {\n    private final Map<String, Integer> ownerByDoc = new HashMap<>();\n\n    void register(String docId, Integer ownerId) {\n        ownerByDoc.put(docId, ownerId);\n    }\n\n    boolean canEdit(String docId, Integer userId) {\n        Integer owner = ownerByDoc.get(docId);\n        return owner == userId;\n    }\n}",
+    "bugLine": 10,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "== compares Integer references, which only match for cached values up to 127, so owners with larger ids are denied access.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Unboxing both Integers to compare them throws NullPointerException whenever the document has no registered owner.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "HashMap.get is not thread safe, so concurrent reads may return an owner id belonging to a different document.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Boxing user ids as Integer allocates a new object on each request, which causes GC pressure under heavy load.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Integer.valueOf caches -128..127, so == happens to work for small ids and for every unit test. In production, ids above 127 are distinct objects, so `==` is false and real owners are locked out of their own documents.",
+    "blastRadius": [
+      "outage",
+      "data-integrity"
+    ],
+    "fixedCode": "class AccessCheck {\n    private final Map<String, Integer> ownerByDoc = new HashMap<>();\n\n    void register(String docId, Integer ownerId) {\n        ownerByDoc.put(docId, ownerId);\n    }\n\n    boolean canEdit(String docId, Integer userId) {\n        Integer owner = ownerByDoc.get(docId);\n        return Objects.equals(owner, userId);\n    }\n}",
+    "interviewNote": "The Integer cache (-128..127) is the canonical Java trap. Never use == on boxed types or Strings."
+  },
+  {
+    "id": "trap-broken-equality-002",
+    "pack": "traps",
+    "language": "java",
+    "difficulty": 2,
+    "severity": "SEV3",
+    "category": "broken-equality",
+    "context": "Pricing service · Money is used as a key in HashMap<Money, List<Offer>> · unit tests only call equals()",
+    "title": "Value object as a map key",
+    "code": "class Money {\n    final long cents;\n    final String currency;\n\n    Money(long cents, String currency) { this.cents = cents; this.currency = currency; }\n\n    @Override\n    public boolean equals(Object o) {\n        if (!(o instanceof Money m)) return false;\n        return cents == m.cents && currency.equals(m.currency);\n    }\n}",
+    "bugLine": 8,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "equals is overridden without hashCode, so equal Money objects hash to different buckets and HashMap lookups miss.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "instanceof with a pattern variable is not null safe, so equals throws NullPointerException when compared with null.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "The fields are final and package-private, so subclasses outside the package cannot compare Money values correctly.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Using long cents makes equals compare by reference for large values, so amounts beyond 127 cents never match.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Hash collections find the bucket with hashCode() first and only then call equals(). With the default Object.hashCode, two equal Money values land in different buckets, so map.get(new Money(500, \"USD\")) returns null. Tests that call equals() directly pass.",
+    "blastRadius": [
+      "data-integrity",
+      "money"
+    ],
+    "fixedCode": "class Money {\n    final long cents;\n    final String currency;\n\n    Money(long cents, String currency) { this.cents = cents; this.currency = currency; }\n\n    @Override\n    public boolean equals(Object o) {\n        if (!(o instanceof Money m)) return false;\n        return cents == m.cents && currency.equals(m.currency);\n    }\n\n    @Override\n    public int hashCode() { return Objects.hash(cents, currency); }\n}",
+    "interviewNote": "The equals/hashCode contract: equal objects must have equal hash codes. Records give you both for free."
+  },
+  {
+    "id": "trap-async-misuse-001",
+    "pack": "traps",
+    "language": "javascript",
+    "difficulty": 1,
+    "severity": "SEV2",
+    "category": "async-misuse",
+    "context": "Express bulk import · 500 orders per request · Postgres + queue",
+    "title": "Bulk order insert",
+    "code": "app.post('/orders/bulk', async (req, res) => {\n  const { orders } = req.body;\n  orders.forEach(async (order) => {\n    await db.insert('orders', order);\n    await queue.publish('order.created', order.id);\n  });\n  res.status(201).json({ created: orders.length });\n});",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "forEach ignores the promises its async callback returns, so the response is sent before inserts finish and failures go unhandled.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Running every insert one after another inside the loop makes a bulk request take far longer than a batched insert would.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Destructuring orders from req.body throws when the body is missing, so malformed requests return a 500 error.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The 201 status is wrong for bulk creation, which should return 200 with the list of created order ids.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "`forEach` doesn't await. The handler responds 'created: 500' immediately; the inserts run in the background, and any failure becomes an unhandled promise rejection (which crashes modern Node). The client believes all 500 orders exist when some never will.",
+    "blastRadius": [
+      "data-loss",
+      "outage"
+    ],
+    "fixedCode": "app.post('/orders/bulk', async (req, res) => {\n  const { orders } = req.body;\n  await Promise.all(\n    orders.map(async (order) => {\n      await db.insert('orders', order);\n      await queue.publish('order.created', order.id);\n    })\n  );\n  res.status(201).json({ created: orders.length });\n});",
+    "interviewNote": "Use for...of for sequential, Promise.all(map) for parallel. forEach(async) is almost always wrong."
+  },
+  {
+    "id": "trap-float-money-001",
+    "pack": "traps",
+    "language": "python",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "float-money",
+    "context": "Invoicing service · finance reconciles to the cent · uses Decimal 'so it is exact'",
+    "title": "Decimal from a float",
+    "code": "from decimal import Decimal\n\ndef apply_discount(price: Decimal, pct: int) -> Decimal:\n    return (price * (100 - pct) / 100).quantize(Decimal(\"0.01\"))\n\ndef line_total(qty: int) -> Decimal:\n    unit = Decimal(19.99)\n    return apply_discount(unit * qty, 10)",
+    "bugLine": 7,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Decimal(19.99) captures the binary float's error digits, so totals carry fractions of a cent and reconciliation drifts.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Decimal division by 100 raises InvalidOperation for prices that do not divide exactly into whole cents.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "quantize rounds half to even by default, so some prices round down where customers expect the amount to round up.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The module-level import makes Decimal global, so changing its precision in one request changes it for every thread.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Decimal(19.99) is Decimal('19.989999999999998436805981327779591083526611328125'). The code looks like it uses exact decimals, but the float was already wrong before it got there. Totals are off by tiny amounts that only surface in end-of-month reconciliation.",
+    "blastRadius": [
+      "money"
+    ],
+    "fixedCode": "from decimal import Decimal\n\ndef apply_discount(price: Decimal, pct: int) -> Decimal:\n    return (price * (100 - pct) / 100).quantize(Decimal(\"0.01\"))\n\ndef line_total(qty: int) -> Decimal:\n    unit = Decimal(\"19.99\")\n    return apply_discount(unit * qty, 10)",
+    "interviewNote": "Always build Decimal from a string (or integer cents). Decimal(0.1) is not 0.1."
+  },
+  {
+    "id": "trap-type-coercion-001",
+    "pack": "traps",
+    "language": "javascript",
+    "difficulty": 1,
+    "severity": "SEV3",
+    "category": "type-coercion",
+    "context": "Leaderboard service · scores are plain numbers · top 10 shown on the homepage",
+    "title": "Top scores",
+    "code": "function topScores(scores, n) {\n  // scores: array of numbers from the leaderboard service\n  const valid = scores.filter((s) => Number.isFinite(s));\n  const sorted = [...valid].sort();\n  return sorted.slice(-n).reverse();\n}\n\nfunction rankOf(scores, mine) {\n  return topScores(scores, scores.length).indexOf(mine) + 1;\n}",
+    "bugLine": 4,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "sort() without a comparator orders values as strings, so 9 ranks above 100 and the leaderboard is wrong.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Spreading the array into a new copy of every score is expensive, so large leaderboards allocate memory on each call.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "slice(-n) returns the wrong elements when n is greater than the array length, producing an empty top list.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Number.isFinite drops zero scores, so players who have not scored yet vanish from the ranking entirely.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Array.prototype.sort() converts elements to strings, so [5, 25, 100, 9] sorts as [100, 25, 5, 9]. With scores under 10 in testing it looks fine; once real scores span different digit counts the 'top 10' is nonsense.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "function topScores(scores, n) {\n  // scores: array of numbers from the leaderboard service\n  const valid = scores.filter((s) => Number.isFinite(s));\n  const sorted = [...valid].sort((a, b) => a - b);\n  return sorted.slice(-n).reverse();\n}\n\nfunction rankOf(scores, mine) {\n  return topScores(scores, scores.length).indexOf(mine) + 1;\n}",
+    "interviewNote": "Default sort is lexicographic. Always pass a comparator for numbers."
+  },
+  {
+    "id": "trap-check-then-act-001",
+    "pack": "traps",
+    "language": "java",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "check-then-act",
+    "context": "WebSocket gateway · Tomcat with 200 threads · duplicates mean two live connections per user",
+    "title": "Thread-safe map, thread-unsafe code",
+    "code": "class SessionRegistry {\n    private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();\n\n    Session getOrCreate(String userId) {\n        if (!sessions.containsKey(userId)) {\n            sessions.put(userId, new Session(userId));\n        }\n        return sessions.get(userId);\n    }\n}\n\nclass Session { Session(String id) {} }",
+    "bugLine": 5,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "The map is thread safe, but check then put is two steps, so two threads can each create a session and one overwrites the other.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "ConcurrentHashMap does not allow reading while another thread writes, so concurrent get calls block until the write ends.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "containsKey walks the whole table on ConcurrentHashMap, so the lookup gets linear as the number of sessions grows.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Constructing the Session eagerly inside the if allocates on every call, wasting memory for users who already have one.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Each method on ConcurrentHashMap is atomic, but a sequence of them isn't. Two threads can both see 'absent', both create a Session (each opening a socket), and the loser's session is orphaned: duplicate connections and leaked resources, under load only.",
+    "blastRadius": [
+      "outage",
+      "data-integrity"
+    ],
+    "fixedCode": "class SessionRegistry {\n    private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();\n\n    Session getOrCreate(String userId) {\n        return sessions.computeIfAbsent(userId, Session::new);\n    }\n}\n\nclass Session { Session(String id) {} }",
+    "interviewNote": "Thread-safe collection ≠ thread-safe usage. Reach for computeIfAbsent / putIfAbsent / merge."
+  },
+  {
+    "id": "trap-race-condition-001",
+    "pack": "traps",
+    "language": "python",
+    "difficulty": 2,
+    "severity": "SEV3",
+    "category": "race-condition",
+    "context": "Metrics module · 16 worker threads · team believes 'Python has the GIL so it is thread safe'",
+    "title": "The GIL will protect me",
+    "code": "import threading\n\nrequest_count = 0\n\ndef handle_request(req):\n    global request_count\n    request_count += 1\n    return process(req)\n\ndef start_workers(n):\n    return [threading.Thread(target=worker_loop) for _ in range(n)]",
+    "bugLine": 7,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "The += is a read, add and write across several bytecodes, so threads can interleave and lose increments despite the GIL.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "The GIL serialises threads, but global variables are copied per thread, so each thread counts only its own requests.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Integers are immutable in Python, so each += builds a new object and the old count is never garbage collected.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "A module-level global resets every time the interpreter reloads the module, so the count restarts on each deploy.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "The GIL guarantees one bytecode at a time, not one statement. `x += 1` compiles to load, add, store, and a thread switch between them loses an update. Counters (and quotas built on them) drift low under real concurrency.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "import threading\n\nrequest_count = 0\n_count_lock = threading.Lock()\n\ndef handle_request(req):\n    global request_count\n    with _count_lock:\n        request_count += 1\n    return process(req)\n\ndef start_workers(n):\n    return [threading.Thread(target=worker_loop) for _ in range(n)]",
+    "interviewNote": "The GIL protects the interpreter, not your invariants. Use a lock or an atomic/queue-based counter."
+  },
+  {
+    "id": "trap-shared-state-002",
+    "pack": "traps",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV3",
+    "category": "shared-state",
+    "context": "Ticketing backend · cinema seat maps · reserving one seat appears to book the whole column",
+    "title": "Building a 2-D grid",
+    "code": "def make_seat_map(rows: int, cols: int) -> list[list[int]]:\n    return [[0] * cols] * rows\n\ndef reserve(seats, row, col, user_id):\n    if seats[row][col] != 0:\n        raise ValueError(\"seat taken\")\n    seats[row][col] = user_id\n\ndef free_count(seats):\n    return sum(1 for row in seats for s in row if s == 0)",
+    "bugLine": 2,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Multiplying the outer list copies references to one row, so reserving a seat in any row marks that column in all rows.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Multiplying a list by an integer copies each element deeply, which doubles memory for venues with many rows.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Seat maps built from nested lists scale poorly, so reserve takes linear time in the number of columns per call.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Returning a nested list leaks internal state because callers can mutate the rows directly and break invariants.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "`[row] * n` makes n references to the same inner list. Reserve seat (2, 5) and every row's seat 5 flips too: a venue sells one ticket per column and the system reports almost nothing available.",
+    "blastRadius": [
+      "data-integrity",
+      "money"
+    ],
+    "fixedCode": "def make_seat_map(rows: int, cols: int) -> list[list[int]]:\n    return [[0] * cols for _ in range(rows)]\n\ndef reserve(seats, row, col, user_id):\n    if seats[row][col] != 0:\n        raise ValueError(\"seat taken\")\n    seats[row][col] = user_id\n\ndef free_count(seats):\n    return sum(1 for row in seats for s in row if s == 0)",
+    "interviewNote": "Same family as the mutable default. Containers are references; `*` copies the reference, not the object."
+  }
+]

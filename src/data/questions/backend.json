@@ -1,0 +1,405 @@
+[
+  {
+    "id": "be-missing-idempotency-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV1",
+    "category": "missing-idempotency",
+    "context": "Flask checkout API · mobile clients retry on timeout · Stripe-style payments API",
+    "title": "Pay-for-order endpoint",
+    "code": "@app.post(\"/orders/<order_id>/pay\")\ndef pay(order_id):\n    order = Order.query.get_or_404(order_id)\n    charge = payments.charge(\n        customer=order.customer_id,\n        amount=order.total_cents,\n        currency=\"usd\",\n    )\n    order.status = \"paid\"\n    order.charge_id = charge.id\n    db.session.commit()\n    return jsonify(status=\"paid\", charge=charge.id)",
+    "bugLine": 4,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "A client or gateway retry after a timeout runs the charge again, because nothing ties the request to a single charge.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Reading total_cents at request time lets the price change between the lookup and the charge, billing the wrong amount.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "The currency is hardcoded to usd, so customers billed in other currencies are charged the wrong amount in production.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Returning the charge id to the client exposes an internal payment identifier that attackers can use to guess other charges.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "On a flaky mobile network the first request succeeds at the provider but the response is lost. The app retries, and the customer is charged twice. Any money-moving endpoint must accept an idempotency key and return the original result on replay.",
+    "blastRadius": [
+      "money"
+    ],
+    "fixedCode": "@app.post(\"/orders/<order_id>/pay\")\ndef pay(order_id):\n    order = Order.query.get_or_404(order_id)\n    charge = payments.charge(\n        customer=order.customer_id,\n        amount=order.total_cents,\n        currency=\"usd\",\n        idempotency_key=f\"order-{order.id}-pay\",\n    )\n    order.status = \"paid\"\n    order.charge_id = charge.id\n    db.session.commit()\n    return jsonify(status=\"paid\", charge=charge.id)",
+    "interviewNote": "Interview angle: 'what if the network drops after the server did the work?' is the idempotency question."
+  },
+  {
+    "id": "be-check-then-act-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "check-then-act",
+    "context": "Flask + SQLAlchemy · 4 gunicorn workers · single-use coupons · 200 req/s at peak",
+    "title": "Coupon redemption",
+    "code": "def redeem(code: str, user_id: int) -> bool:\n    coupon = Coupon.query.filter_by(code=code).one()\n    if coupon.redeemed_at is not None:\n        return False\n    coupon.redeemed_at = datetime.now(timezone.utc)\n    coupon.redeemed_by = user_id\n    db.session.add(Redemption(coupon_id=coupon.id, user_id=user_id))\n    db.session.commit()\n    return True",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Two concurrent requests can both see the coupon unredeemed before either commits, so a single-use coupon is redeemed twice.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Storing the timestamp in UTC rather than local time makes the redemption window shift by an hour during DST changes.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Using .one() raises when the code is unknown, so mistyped codes return a 500 instead of a clean validation message.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Adding the Redemption row in the same session as the update means a failure there silently drops the coupon change.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "The check and the write are separate steps with a gap between them. With four workers at 200 req/s, a double-click or a retry lands two requests inside that gap, and both succeed. It passes every sequential test.",
+    "blastRadius": [
+      "money",
+      "data-integrity"
+    ],
+    "fixedCode": "def redeem(code: str, user_id: int) -> bool:\n    updated = (\n        Coupon.query.filter_by(code=code, redeemed_at=None)\n        .update({\"redeemed_at\": datetime.now(timezone.utc), \"redeemed_by\": user_id})\n    )\n    if updated == 0:\n        return False\n    db.session.commit()\n    return True",
+    "interviewNote": "Fix with one atomic conditional UPDATE and check the affected-row count, not SELECT-then-UPDATE."
+  },
+  {
+    "id": "be-n-plus-one-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV2",
+    "category": "n-plus-one",
+    "context": "Export endpoint · 50k order ids per call · Postgres over the network, 2 ms round trip",
+    "title": "Order export",
+    "code": "def export_orders(order_ids: list[int]) -> list[dict]:\n    out = []\n    for oid in order_ids:\n        lines = db.fetch_all(\n            \"SELECT sku, qty, price_cents FROM order_lines WHERE order_id = %s\",\n            (oid,),\n        )\n        out.append({\"order_id\": oid, \"lines\": lines})\n    return out",
+    "bugLine": 4,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "One query per order id means 50k round trips per export, so latency and database load grow linearly with the batch size.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Collecting results into a list holds all 50k orders in memory at once, which will exhaust the worker's heap.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Passing oid as a bound parameter stops Postgres reusing a cached plan, so each lookup is planned from scratch.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Selecting named columns instead of star blocks index-only scans on order_lines, so each query reads the full heap.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "50,000 queries × 2 ms of network time is 100 seconds before any work happens, and it hammers the connection pool. It's fast on a dev laptop with 20 ids and a local database; it only shows up at production batch sizes.",
+    "blastRadius": [
+      "outage",
+      "cost"
+    ],
+    "fixedCode": "def export_orders(order_ids: list[int]) -> list[dict]:\n    rows = db.fetch_all(\n        \"SELECT order_id, sku, qty, price_cents FROM order_lines WHERE order_id = ANY(%s)\",\n        (order_ids,),\n    )\n    by_order: dict[int, list] = {oid: [] for oid in order_ids}\n    for r in rows:\n        by_order[r[\"order_id\"]].append(r)\n    return [{\"order_id\": oid, \"lines\": ls} for oid, ls in by_order.items()]",
+    "interviewNote": "Queries inside loops are the N+1 smell — look for I/O in a for."
+  },
+  {
+    "id": "be-missing-timeout-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 1,
+    "severity": "SEV1",
+    "category": "missing-timeout",
+    "context": "Checkout · 20 gunicorn sync workers · carrier API hangs a few times a month",
+    "title": "Shipping quote lookup",
+    "code": "def get_shipping_quote(order: Order) -> int:\n    if not order.zip:\n        raise ValueError(\"zip required\")\n    payload = {\"zip\": order.zip, \"weight_g\": order.weight_g}\n    resp = requests.post(f\"{CARRIER_URL}/quotes\", json=payload)\n    resp.raise_for_status()\n    quote = resp.json()\n    log.info(\"quote for %s: %s\", order.id, quote[\"price_cents\"])\n    return quote[\"price_cents\"]",
+    "bugLine": 5,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "With no timeout, a hung carrier API blocks each worker forever, so all 20 workers stick and checkout goes down.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "requests.post opens a new TCP connection on every call, which exhausts ephemeral ports under sustained checkout traffic.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "raise_for_status turns every 4xx from the carrier into an exception, so one bad zip code takes the whole checkout down.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The quote price is trusted blindly, so a carrier response with a negative number would give customers free shipping.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "requests has no default timeout: a connection that never answers waits forever. Each hung call pins one of 20 workers; after 20 stuck requests the whole site returns 502s although the CPU is idle and every dashboard looks healthy.",
+    "blastRadius": [
+      "outage"
+    ],
+    "fixedCode": "def get_shipping_quote(order: Order) -> int:\n    if not order.zip:\n        raise ValueError(\"zip required\")\n    payload = {\"zip\": order.zip, \"weight_g\": order.weight_g}\n    resp = requests.post(f\"{CARRIER_URL}/quotes\", json=payload, timeout=(2, 5))\n    resp.raise_for_status()\n    quote = resp.json()\n    log.info(\"quote for %s: %s\", order.id, quote[\"price_cents\"])\n    return quote[\"price_cents\"]",
+    "interviewNote": "Every outbound call needs a timeout. 'No timeout' is a default in many libraries, not a safe choice."
+  },
+  {
+    "id": "be-pagination-001",
+    "pack": "backend",
+    "language": "javascript",
+    "difficulty": 1,
+    "severity": "SEV3",
+    "category": "pagination-off-by-one",
+    "context": "Express + Postgres · product catalog · pages are 1-based in the public API docs",
+    "title": "Catalog pagination",
+    "code": "app.get('/api/products', async (req, res) => {\n  const page = Math.max(1, Number(req.query.page) || 1);\n  const pageSize = 20;\n  const offset = page * pageSize;\n  const { rows } = await db.query(\n    'SELECT id, name FROM products ORDER BY id LIMIT $1 OFFSET $2',\n    [pageSize, offset]\n  );\n  res.json({ page, items: rows });\n});",
+    "bugLine": 4,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Pages are 1-based but the offset is not shifted, so the first 20 products are never returned and every page is off by one.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "OFFSET pagination re-scans the skipped rows, so deep pages get slower and eventually time out on a large table.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "The page size is fixed at 20, so clients on large screens must issue many requests to render a single list.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "ORDER BY id with no secondary key makes the sort unstable, so rows can repeat across pages when ids tie.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "Page 1 starts at offset 20, so the 20 newest or lowest-id products are unreachable through the API, and the last page request asks past the end. Nobody notices because every page 'looks' full.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "app.get('/api/products', async (req, res) => {\n  const page = Math.max(1, Number(req.query.page) || 1);\n  const pageSize = 20;\n  const offset = (page - 1) * pageSize;\n  const { rows } = await db.query(\n    'SELECT id, name FROM products ORDER BY id LIMIT $1 OFFSET $2',\n    [pageSize, offset]\n  );\n  res.json({ page, items: rows });\n});",
+    "interviewNote": "Write the off-by-one test: request page 1 and assert the first row."
+  },
+  {
+    "id": "be-cache-stampede-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 2,
+    "severity": "SEV1",
+    "category": "cache-stampede",
+    "context": "Homepage 2k req/s · compute_stats runs ~8 s of heavy SQL · Redis cache with 60 s TTL",
+    "title": "Homepage stats cache",
+    "code": "def get_homepage_stats() -> dict:\n    ttl = 60\n    cached = cache.get(\"homepage:stats\")\n    if cached is not None:\n        return json.loads(cached)\n    stats = compute_stats()\n    cache.set(\"homepage:stats\", json.dumps(stats), ex=ttl)\n    return stats",
+    "bugLine": 6,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "When the key expires, every concurrent request misses and runs the 8 second query at once, overwhelming the database.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "A 60 second TTL means visitors see stale numbers, so the homepage statistics will often be a minute out of date.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Storing JSON strings instead of native objects costs CPU on every cache hit and slows the hot path measurably.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "cache.get returning None for an empty result makes the stats get recomputed on every single request.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "For 59 seconds all is well. The moment the key expires, thousands of requests per second see a miss and each launches the 8 second query. The database falls over, so nobody repopulates the cache, and the outage feeds itself.",
+    "blastRadius": [
+      "outage"
+    ],
+    "fixedCode": "def get_homepage_stats() -> dict:\n    ttl = 60\n    cached = cache.get(\"homepage:stats\")\n    if cached is not None:\n        return json.loads(cached)\n    with cache.lock(\"homepage:stats:lock\", timeout=30, blocking_timeout=0):\n        stats = compute_stats()\n        cache.set(\"homepage:stats\", json.dumps(stats), ex=ttl)\n        return stats",
+    "interviewNote": "Mitigations: single-flight lock, stale-while-revalidate, jittered TTLs, background refresh."
+  },
+  {
+    "id": "be-shared-state-001",
+    "pack": "backend",
+    "language": "java",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "shared-state",
+    "context": "Spring Boot service · Tomcat with 200 threads · timestamps formatted in order exports",
+    "title": "Shared date formatter",
+    "code": "class OrderFormatter {\n    private static final SimpleDateFormat FMT =\n        new SimpleDateFormat(\"yyyy-MM-dd HH:mm:ss\");\n\n    String format(Date placedAt) {\n        return FMT.format(placedAt);\n    }\n\n    Date parse(String text) throws ParseException {\n        return FMT.parse(text);\n    }\n}",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "SimpleDateFormat has mutable internal state, so a shared static instance garbles or throws under concurrent calls.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "HH is the 24-hour field, so afternoon times are formatted as morning times in the exported file.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "The pattern string is compiled again on each class load, which slows application startup noticeably.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "parse declares ParseException, which forces callers into broad catch blocks that hide real failures.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "SimpleDateFormat uses an internal Calendar while formatting. Under concurrent calls threads overwrite each other's fields, producing wrong dates or NumberFormatException — only under load, never in a single-threaded test.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "class OrderFormatter {\n    private static final DateTimeFormatter FMT =\n        DateTimeFormatter.ofPattern(\"yyyy-MM-dd HH:mm:ss\").withZone(ZoneOffset.UTC);\n\n    String format(Instant placedAt) {\n        return FMT.format(placedAt);\n    }\n\n    Instant parse(String text) {\n        return Instant.from(FMT.parse(text));\n    }\n}",
+    "interviewNote": "Classic Java trap. java.time formatters are immutable and thread-safe; SimpleDateFormat is not."
+  },
+  {
+    "id": "be-resource-leak-001",
+    "pack": "backend",
+    "language": "java",
+    "difficulty": 2,
+    "severity": "SEV1",
+    "category": "resource-leak",
+    "context": "Spring Boot · HikariCP pool of 10 connections · some lookups hit missing account ids",
+    "title": "Balance lookup",
+    "code": "class AccountRepo {\n    private final DataSource ds;\n    AccountRepo(DataSource ds) { this.ds = ds; }\n\n    long balanceOf(long id) throws SQLException {\n        Connection conn = ds.getConnection();\n        PreparedStatement ps = conn.prepareStatement(\"SELECT balance FROM accounts WHERE id = ?\");\n        ps.setLong(1, id);\n        ResultSet rs = ps.executeQuery();\n        rs.next();\n        long balance = rs.getLong(1);\n        conn.close();\n        return balance;\n    }\n}",
+    "bugLine": 12,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "If the query throws or no row exists, execution skips close(), so connections leak until the pool is exhausted and requests hang.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Closing the connection before the ResultSet and statement are closed discards the pending results and can return a wrong balance.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Preparing the statement on every call defeats statement caching and makes each lookup slower than a plain Statement would.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The lookup runs outside any transaction, so another thread can change the balance between the query and the return.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "A lookup for a missing id throws from getLong, skipping close(). Each such request permanently removes one of the 10 pooled connections; after ten of them every request blocks waiting for a connection and the whole service appears hung.",
+    "blastRadius": [
+      "outage"
+    ],
+    "fixedCode": "class AccountRepo {\n    private final DataSource ds;\n    AccountRepo(DataSource ds) { this.ds = ds; }\n\n    long balanceOf(long id) throws SQLException {\n        try (Connection conn = ds.getConnection();\n             PreparedStatement ps = conn.prepareStatement(\"SELECT balance FROM accounts WHERE id = ?\")) {\n            ps.setLong(1, id);\n            try (ResultSet rs = ps.executeQuery()) {\n                if (!rs.next()) throw new NoSuchElementException(\"account \" + id);\n                return rs.getLong(1);\n            }\n        }\n    }\n}",
+    "interviewNote": "Close on every path: try-with-resources (Java), `with` (Python), `using` (C#)."
+  },
+  {
+    "id": "be-swallowed-exception-001",
+    "pack": "backend",
+    "language": "python",
+    "difficulty": 2,
+    "severity": "SEV2",
+    "category": "swallowed-exception",
+    "context": "Flask · payment provider webhooks · provider retries any non-2xx for 3 days",
+    "title": "Payment webhook",
+    "code": "@app.post(\"/webhooks/payment\")\ndef payment_webhook():\n    verify_signature(request.headers, request.data)\n    event = request.get_json()\n    if event.get(\"type\") != \"payment.succeeded\":\n        return \"\", 204\n    try:\n        mark_order_paid(event[\"order_id\"])\n    except Exception as exc:\n        log.warning(\"webhook failed: %s\", exc)\n    return \"\", 200",
+    "bugLine": 11,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "A 200 is returned even when processing failed, so the provider never retries and the paid order stays unpaid for good.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "Catching Exception also catches KeyboardInterrupt, so a shutdown signal during processing is swallowed and the worker hangs.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Logging at warning level instead of error means the failures never reach the on-call alerting pipeline.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "Returning 204 for other event types makes the provider assume the event was dropped and resend it repeatedly.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "The provider's retry mechanism is your safety net, and a blanket 200 disables it. A transient database error leaves a customer who paid, with an order that still says unpaid and nobody alerted, until support tickets arrive.",
+    "blastRadius": [
+      "money",
+      "data-integrity"
+    ],
+    "fixedCode": "@app.post(\"/webhooks/payment\")\ndef payment_webhook():\n    verify_signature(request.headers, request.data)\n    event = request.get_json()\n    if event.get(\"type\") != \"payment.succeeded\":\n        return \"\", 204\n    try:\n        mark_order_paid(event[\"order_id\"])\n    except Exception:\n        log.exception(\"webhook processing failed\")\n        return \"\", 500  # let the provider retry\n    return \"\", 200",
+    "interviewNote": "Return success only after the work succeeded. Make the handler idempotent so retries are safe."
+  },
+  {
+    "id": "be-timezone-001",
+    "pack": "backend",
+    "language": "javascript",
+    "difficulty": 2,
+    "severity": "SEV3",
+    "category": "timezone",
+    "context": "Merchant dashboard · API servers run in UTC · merchants in 40 countries · shows 'today's sales'",
+    "title": "Today's sales total",
+    "code": "async function todaysSales(merchant) {\n  const start = new Date();\n  start.setHours(0, 0, 0, 0);\n  const end = new Date(start);\n  end.setDate(end.getDate() + 1);\n  const { rows } = await db.query(\n    'SELECT SUM(total_cents) AS sum FROM orders WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3',\n    [merchant.id, start, end]\n  );\n  return rows[0].sum ?? 0;\n}",
+    "bugLine": 3,
+    "reasons": [
+      {
+        "id": "a",
+        "text": "Midnight is computed in the server's timezone, not the merchant's, so 'today' is wrong for most merchants and shifts at odd hours.",
+        "correct": true
+      },
+      {
+        "id": "b",
+        "text": "A SUM over a large orders table without a covering index scans every order for the merchant on each dashboard load.",
+        "correct": false
+      },
+      {
+        "id": "c",
+        "text": "Date objects are mutable, so setHours changes the shared start value that other requests are also reading at the time.",
+        "correct": false
+      },
+      {
+        "id": "d",
+        "text": "The nullish fallback hides the difference between zero sales and a missing value, so errors show up as empty days.",
+        "correct": false
+      }
+    ],
+    "productionImpact": "A merchant in Sydney sees yesterday's late sales as 'today' until 10am, and a merchant in Los Angeles sees 'today' reset at 4pm. The numbers are internally consistent, so it looks plausible, and finance catches it weeks later.",
+    "blastRadius": [
+      "data-integrity"
+    ],
+    "fixedCode": "async function todaysSales(merchant) {\n  const { start, end } = dayBoundsUtc(merchant.timeZone, new Date());\n  const { rows } = await db.query(\n    'SELECT SUM(total_cents) AS sum FROM orders WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3',\n    [merchant.id, start, end]\n  );\n  return rows[0].sum ?? 0;\n}",
+    "interviewNote": "Store UTC, compute day boundaries in the user's zone. Never use server-local time for business days."
+  }
+]
