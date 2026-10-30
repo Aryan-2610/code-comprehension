@@ -1,25 +1,25 @@
 import { describe, expect, it } from 'vitest'
-import { scoreQuestion, shareText, speedBonus, streakMultiplier, outcomeOf } from './scoring'
+import { MAX_TIME_MS, scoreQuestion, shareText, speedBonus, streakMultiplier, outcomeOf } from './scoring'
 
 describe('scoring', () => {
   it('wrong line scores 0', () => {
-    expect(scoreQuestion({ lineCorrect: false, reasonCorrect: false, remainingMs: 30000, streak: 3 })).toMatchObject({
+    expect(scoreQuestion({ lineCorrect: false, reasonCorrect: false, remainingMs: MAX_TIME_MS, streak: 3 })).toMatchObject({
       points: 0,
       outcome: 'miss',
     })
   })
   it('right line, wrong reason is 50 and partial, no speed bonus, no streak', () => {
-    expect(scoreQuestion({ lineCorrect: true, reasonCorrect: false, remainingMs: 30000, streak: 4 })).toMatchObject({
+    expect(scoreQuestion({ lineCorrect: true, reasonCorrect: false, remainingMs: MAX_TIME_MS, streak: 4 })).toMatchObject({
       points: 50,
       outcome: 'partial',
     })
   })
   it('full marks at the instant of starting is 100', () => {
-    expect(scoreQuestion({ lineCorrect: true, reasonCorrect: true, remainingMs: 30000, streak: 0 }).points).toBe(100)
+    expect(scoreQuestion({ lineCorrect: true, reasonCorrect: true, remainingMs: MAX_TIME_MS, streak: 0 }).points).toBe(100)
   })
   it('speed bonus scales with remaining time and clamps', () => {
-    expect(speedBonus(30000)).toBe(20)
-    expect(speedBonus(15000)).toBe(10)
+    expect(speedBonus(MAX_TIME_MS)).toBe(20)
+    expect(speedBonus(MAX_TIME_MS / 2)).toBe(10)
     expect(speedBonus(0)).toBe(0)
     expect(speedBonus(99999)).toBe(20)
     expect(speedBonus(-5)).toBe(0)
