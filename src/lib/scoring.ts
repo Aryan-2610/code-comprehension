@@ -1,4 +1,4 @@
-export const MAX_TIME_MS = 30_000
+export const MAX_TIME_MS = 60_000
 export const LINE_POINTS = 50
 export const REASON_POINTS = 30
 export const SPEED_POINTS = 20
